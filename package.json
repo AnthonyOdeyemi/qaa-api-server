@@ -1,17 +1,16 @@
 {
   "name": "qaa-api-server",
-  "version": "1.0.0",
-  "description": "API server for QAA AI Assessor Tool - TVET IDEAS NBTE/NSQ",
+  "version": "2.0.0",
+  "description": "QAA AI Assessor Tool - Backend API with auth, credits and Paystack",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
     "cors": "^2.8.5",
-    "express": "^4.18.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "express": "^4.18.2",
+    "pg": "^8.11.3"
   }
 }
