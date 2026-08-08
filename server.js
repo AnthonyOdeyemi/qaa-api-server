@@ -1,4 +1,3 @@
-//v2.0
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -26,6 +25,7 @@ async function initDB() {
         name VARCHAR(255) NOT NULL,
         phone VARCHAR(50),
         nbte_number VARCHAR(100),
+        skill_areas TEXT[],
         password_hash VARCHAR(255) NOT NULL,
         free_reports_used INTEGER DEFAULT 0,
         paid_credits INTEGER DEFAULT 0,
@@ -477,7 +477,7 @@ app.get('/api/admin/stats', async (req, res) => {
 
     // All users
     const usersResult = await pool.query(`
-      SELECT id, name, email, phone, nbte_number, free_reports_used, paid_credits, 
+      SELECT id, name, email, phone, nbte_number, skill_areas, free_reports_used, paid_credits, 
              total_reports_generated, created_at, last_login
       FROM users ORDER BY created_at DESC
     `);
