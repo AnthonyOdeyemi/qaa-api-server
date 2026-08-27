@@ -467,12 +467,12 @@ app.get('/api/admin/stats', async (req, res) => {
     // Summary stats
     const statsResult = await pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM users) as total_users,
-        (SELECT COALESCE(SUM(total_reports_generated),0) FROM users) as total_reports,
-        (SELECT COALESCE(SUM(amount_kobo),0) FROM transactions WHERE status='success') as total_revenue,
-        (SELECT COUNT(*) FROM report_logs WHERE created_at > NOW() - INTERVAL '1 day') as today_reports,
-        (SELECT COUNT(DISTINCT user_id) FROM report_logs WHERE created_at > NOW() - INTERVAL '7 days') as active_this_week,
-        (SELECT COUNT(*) FROM transactions WHERE status='success') as paid_transactions
+        (SELECT COUNT(*) FROM users)::int as "totalUsers",
+        (SELECT COALESCE(SUM(total_reports_generated),0) FROM users)::int as "totalReports",
+        (SELECT COALESCE(SUM(amount_kobo),0) FROM transactions WHERE status='success')::int as "totalRevenue",
+        (SELECT COUNT(*) FROM report_logs WHERE created_at > NOW() - INTERVAL '1 day')::int as "todayReports",
+        (SELECT COUNT(DISTINCT user_id) FROM report_logs WHERE created_at > NOW() - INTERVAL '7 days')::int as "activeThisWeek",
+        (SELECT COUNT(*) FROM transactions WHERE status='success')::int as "paidTransactions"
     `);
 
     // All users
