@@ -455,7 +455,7 @@ app.get('/api/admin/stats', async (req, res) => {
   const adminKey = req.headers['x-admin-key'];
   
   // Verify admin password
-  if (adminKey !== (process.env.ADMIN_PASSWORD || 'QAA@Admin2026')) {
+  if (!process.env.ADMIN_PASSWORD || adminKey !== process.env.ADMIN_PASSWORD) {
     return res.status(403).json({ error: 'Admin access denied' });
   }
   
