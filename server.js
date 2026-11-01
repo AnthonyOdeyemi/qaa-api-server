@@ -55,6 +55,14 @@ async function initDB() {
         credit_type VARCHAR(20),
         created_at TIMESTAMP DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(128) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
     `);
     console.log('Database tables initialised');
   } catch (err) {
@@ -68,28 +76,57 @@ function hashPassword(password) {
   return crypto.createHash('sha256').update(password + process.env.SALT || 'qaa2026').digest('hex');
 }
 
+function tokenSecret() {
+  return process.env.TOKEN_SECRET || process.env.DATABASE_URL || 'qaa-fallback-secret';
+}
+
+// Signed token: base64url(userId:email:expiry).HMAC — cannot be forged without the server secret
 function generateToken(userId, email) {
-  const payload = `${userId}:${email}:${Date.now()}`;
-  return crypto.createHash('sha256').update(payload + (process.env.TOKEN_SECRET || 'qaasecret2026')).digest('hex') + '.' + Buffer.from(`${userId}:${email}`).toString('base64');
+  const exp = Date.now() + 30 * 24 * 60 * 60 * 1000;
+  const payload = Buffer.from(`${userId}:${email}:${exp}`).toString('base64url');
+  const sig = crypto.createHmac('sha256', tokenSecret()).update(payload).digest('hex');
+  return payload + '.' + sig;
 }
 
 function parseToken(token) {
   try {
     if (!token) return null;
-    const parts = token.split('.');
-    if (parts.length < 2) return null;
-    const decoded = Buffer.from(parts[1], 'base64').toString('utf8');
-    const [userId, email] = decoded.split(':');
+    const [payload, sig] = token.split('.');
+    if (!payload || !sig) return null;
+    const expected = crypto.createHmac('sha256', tokenSecret()).update(payload).digest('hex');
+    const a = Buffer.from(sig, 'hex'), b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const [userId, email, exp] = Buffer.from(payload, 'base64url').toString('utf8').split(':');
+    if (!exp || Date.now() > parseInt(exp)) return null;
     return { userId: parseInt(userId), email };
   } catch (e) {
     return null;
   }
 }
 
+function adminEmails() {
+  return (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+}
+function isAdminUser(user) {
+  return !!user && adminEmails().includes((user.email || '').toLowerCase());
+}
+function userPayload(u) {
+  return {
+    id: u.id,
+    name: u.name,
+    email: u.email,
+    freeReportsUsed: u.free_reports_used,
+    paidCredits: u.paid_credits,
+    freeRemaining: Math.max(0, 2 - u.free_reports_used),
+    totalReports: u.total_reports_generated,
+    isAdmin: isAdminUser(u)
+  };
+}
+
 async function getUserFromToken(token) {
   const parsed = parseToken(token);
   if (!parsed) return null;
-  const result = await pool.query('SELECT * FROM users WHERE id = $1 AND email = $2', [parsed.userId, parsed.email]);
+  const result = await pool.query('SELECT * FROM users WHERE id = $1 AND LOWER(email) = LOWER($2)', [parsed.userId, parsed.email]);
   return result.rows[0] || null;
 }
 
@@ -107,34 +144,24 @@ const BUNDLES = {
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
-  const { name, email, phone, nbte_number, password } = req.body;
+  const { name, phone, nbte_number, password, skill_areas } = req.body;
+  const email = (req.body.email || '').trim().toLowerCase();
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'Name, email and password are required' });
   }
   try {
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const existing = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1', [email]);
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
     const hash = hashPassword(password);
     const result = await pool.query(
-      'INSERT INTO users (name, email, phone, nbte_number, password_hash) VALUES ($1,$2,$3,$4,$5) RETURNING id, name, email, free_reports_used, paid_credits',
-      [name, email, phone || null, nbte_number || null, hash]
+      'INSERT INTO users (name, email, phone, nbte_number, skill_areas, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, name, email, free_reports_used, paid_credits, total_reports_generated',
+      [name, email, phone || null, nbte_number || null, Array.isArray(skill_areas) ? skill_areas : [], hash]
     );
     const user = result.rows[0];
     const token = generateToken(user.id, user.email);
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        freeReportsUsed: user.free_reports_used,
-        paidCredits: user.paid_credits,
-        freeRemaining: Math.max(0, 2 - user.free_reports_used)
-      }
-    });
+    res.json({ success: true, token, user: userPayload(user) });
   } catch (err) {
     res.status(500).json({ error: 'Registration failed: ' + err.message });
   }
@@ -142,14 +169,15 @@ app.post('/api/auth/register', async (req, res) => {
 
 // Login
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = req.body.password;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
   }
   try {
     const hash = hashPassword(password);
     const result = await pool.query(
-      'SELECT id, name, email, free_reports_used, paid_credits, total_reports_generated FROM users WHERE email = $1 AND password_hash = $2',
+      'SELECT id, name, email, free_reports_used, paid_credits, total_reports_generated FROM users WHERE LOWER(email) = $1 AND password_hash = $2',
       [email, hash]
     );
     if (!result.rows.length) {
@@ -158,19 +186,7 @@ app.post('/api/auth/login', async (req, res) => {
     const user = result.rows[0];
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
     const token = generateToken(user.id, user.email);
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        freeReportsUsed: user.free_reports_used,
-        paidCredits: user.paid_credits,
-        freeRemaining: Math.max(0, 2 - user.free_reports_used),
-        totalReports: user.total_reports_generated
-      }
-    });
+    res.json({ success: true, token, user: userPayload(user) });
   } catch (err) {
     res.status(500).json({ error: 'Login failed: ' + err.message });
   }
@@ -181,17 +197,70 @@ app.get('/api/auth/me', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
-  res.json({
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      freeReportsUsed: user.free_reports_used,
-      paidCredits: user.paid_credits,
-      freeRemaining: Math.max(0, 2 - user.free_reports_used),
-      totalReports: user.total_reports_generated
-    }
-  });
+  res.json({ user: userPayload(user) });
+});
+
+// ── Send email through Brevo (needs BREVO_API_KEY + BREVO_SENDER_EMAIL) ──
+async function sendEmail(to, subject, html) {
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL) return false;
+  try {
+    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { name: 'QAA Assessor Tool', email: process.env.BREVO_SENDER_EMAIL },
+        to: [{ email: to }],
+        subject,
+        htmlContent: html
+      })
+    });
+    return r.ok;
+  } catch (e) {
+    console.error('Email error:', e.message);
+    return false;
+  }
+}
+
+// Forgot password — always returns the same message so emails cannot be probed
+app.post('/api/auth/forgot', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const generic = { success: true, message: 'If an account exists for that email, a reset link has been sent. Check your inbox and spam folder.' };
+  if (!email) return res.status(400).json({ error: 'Enter your email address' });
+  try {
+    const u = await pool.query('SELECT id, name, email FROM users WHERE LOWER(email) = $1', [email]);
+    if (!u.rows.length) return res.json(generic);
+    const user = u.rows[0];
+    const recent = await pool.query("SELECT 1 FROM password_resets WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 seconds'", [user.id]);
+    if (recent.rows.length) return res.json(generic);
+    const raw = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
+    await pool.query('DELETE FROM password_resets WHERE user_id = $1', [user.id]);
+    await pool.query("INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2, NOW() + INTERVAL '1 hour')", [user.id, tokenHash]);
+    const link = (process.env.APP_URL || 'https://nsq-assessor-tool.netlify.app') + '/?reset=' + raw;
+    await sendEmail(user.email, 'Reset your QAA Assessor Tool password',
+      `<p>Hello ${String(user.name).replace(/[<>&"]/g, '')},</p><p>Click the link below to set a new password. It expires in 1 hour.</p><p><a href="${link}">Reset my password</a></p><p>If you did not ask for this, ignore this email.</p>`);
+    res.json(generic);
+  } catch (err) {
+    res.status(500).json({ error: 'Could not process request' });
+  }
+});
+
+// Reset password with emailed token
+app.post('/api/auth/reset', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password || password.length < 6) {
+    return res.status(400).json({ error: 'A valid link and a password of at least 6 characters are required' });
+  }
+  try {
+    const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+    const r = await pool.query('SELECT user_id FROM password_resets WHERE token_hash = $1 AND expires_at > NOW()', [tokenHash]);
+    if (!r.rows.length) return res.status(400).json({ error: 'This reset link is invalid or has expired. Please request a new one.' });
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(password), r.rows[0].user_id]);
+    await pool.query('DELETE FROM password_resets WHERE user_id = $1', [r.rows[0].user_id]);
+    res.json({ success: true, message: 'Password updated. You can now sign in.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not reset password' });
+  }
 });
 
 // ══════════════════════════════════════════════
@@ -207,12 +276,14 @@ app.post('/api/claude', async (req, res) => {
     return res.status(401).json({ error: 'Please log in to generate reports' });
   }
 
-  // Check credits
+  const isAdmin = isAdminUser(user);
+
+  // Check credits (admin accounts are unlimited)
   const freeRemaining = Math.max(0, 2 - user.free_reports_used);
   const hasFreeCredits = freeRemaining > 0;
   const hasPaidCredits = user.paid_credits > 0;
 
-  if (!hasFreeCredits && !hasPaidCredits) {
+  if (!isAdmin && !hasFreeCredits && !hasPaidCredits) {
     return res.status(402).json({
       error: 'INSUFFICIENT_CREDITS',
       message: 'You have used all your free reports. Please purchase a bundle to continue.',
@@ -233,8 +304,10 @@ app.post('/api/claude', async (req, res) => {
     const text = response.content.map(b => b.text || '').join('');
 
     // Deduct credit
-    const creditType = hasFreeCredits ? 'free' : 'paid';
-    if (hasFreeCredits) {
+    const creditType = isAdmin ? 'admin' : (hasFreeCredits ? 'free' : 'paid');
+    if (isAdmin) {
+      await pool.query('UPDATE users SET total_reports_generated = total_reports_generated + 1 WHERE id = $1', [user.id]);
+    } else if (hasFreeCredits) {
       await pool.query('UPDATE users SET free_reports_used = free_reports_used + 1, total_reports_generated = total_reports_generated + 1 WHERE id = $1', [user.id]);
     } else {
       await pool.query('UPDATE users SET paid_credits = paid_credits - 1, total_reports_generated = total_reports_generated + 1 WHERE id = $1', [user.id]);
@@ -255,6 +328,7 @@ app.post('/api/claude', async (req, res) => {
       creditsRemaining: {
         freeRemaining: Math.max(0, 2 - updatedUser.free_reports_used),
         paidCredits: updatedUser.paid_credits,
+        unlimited: isAdmin,
         creditUsed: creditType
       }
     });
@@ -462,6 +536,7 @@ app.get('/api/admin/stats', async (req, res) => {
   // Verify user is logged in
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
+  if (adminEmails().length && !isAdminUser(user)) return res.status(403).json({ error: 'Admin access denied' });
 
   try {
     // Summary stats
@@ -523,6 +598,27 @@ app.get('/api/admin/stats', async (req, res) => {
 });
 
 // Health check
+// Admin: set a temporary password for a user (fallback when email reset is not configured)
+app.post('/api/admin/reset-password', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (!process.env.ADMIN_PASSWORD || adminKey !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).json({ error: 'Admin access denied' });
+  }
+  const user = await getUserFromToken(req.headers.authorization?.replace('Bearer ', ''));
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
+  if (adminEmails().length && !isAdminUser(user)) return res.status(403).json({ error: 'Admin access denied' });
+  const email = (req.body.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  try {
+    const temp = crypto.randomBytes(5).toString('hex');
+    const r = await pool.query('UPDATE users SET password_hash = $1 WHERE LOWER(email) = $2 RETURNING email', [hashPassword(temp), email]);
+    if (!r.rows.length) return res.status(404).json({ error: 'No user with that email' });
+    res.json({ success: true, email: r.rows[0].email, tempPassword: temp });
+  } catch (err) {
+    res.status(500).json({ error: 'Reset failed' });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
