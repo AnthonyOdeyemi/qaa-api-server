@@ -34,6 +34,16 @@ async function initDB() {
         last_login TIMESTAMP
       );
 
+      -- Migrations: add columns that older versions of the table may lack
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS nbte_number VARCHAR(100);
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS skill_areas TEXT[];
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS free_reports_used INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS paid_credits INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS total_reports_generated INTEGER DEFAULT 0;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
+
       CREATE TABLE IF NOT EXISTS transactions (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id),
