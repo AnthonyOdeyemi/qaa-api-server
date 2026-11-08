@@ -534,19 +534,31 @@ app.get('/api/transactions', async (req, res) => {
 // ══════════════════════════════════════════════
 // ADMIN ROUTES
 // ══════════════════════════════════════════════
-app.get('/api/admin/stats', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  const adminKey = req.headers['x-admin-key'];
-  
-  // Verify admin password
-  if (!process.env.ADMIN_PASSWORD || adminKey !== process.env.ADMIN_PASSWORD) {
-    return res.status(403).json({ error: 'Admin access denied' });
+// Shared admin gate: returns the user if allowed, otherwise sends a specific error
+async function adminGate(req, res) {
+  if (!process.env.ADMIN_PASSWORD) {
+    res.status(503).json({ error: 'ADMIN_PASSWORD is not set on the server (add it in Railway Variables)' });
+    return null;
   }
-  
-  // Verify user is logged in
-  const user = await getUserFromToken(token);
-  if (!user) return res.status(401).json({ error: 'Not authenticated' });
-  if (adminEmails().length && !isAdminUser(user)) return res.status(403).json({ error: 'Admin access denied' });
+  if (req.headers['x-admin-key'] !== process.env.ADMIN_PASSWORD) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return null;
+  }
+  const user = await getUserFromToken(req.headers.authorization?.replace('Bearer ', ''));
+  if (!user) {
+    res.status(401).json({ error: 'Your sign-in has expired. Sign out, sign in again, then retry' });
+    return null;
+  }
+  if (adminEmails().length && !isAdminUser(user)) {
+    res.status(403).json({ error: 'This account (' + user.email + ') is not listed in ADMIN_EMAILS' });
+    return null;
+  }
+  return user;
+}
+
+app.get('/api/admin/stats', async (req, res) => {
+  const adminUser = await adminGate(req, res);
+  if (!adminUser) return;
 
   try {
     // Summary stats
@@ -608,15 +620,34 @@ app.get('/api/admin/stats', async (req, res) => {
 });
 
 // Health check
+// Admin: record a manual (bank transfer) payment and add credits
+app.post('/api/admin/add-credits', async (req, res) => {
+  const adminUser = await adminGate(req, res);
+  if (!adminUser) return;
+  const email = (req.body.email || '').trim().toLowerCase();
+  const bundle = BUNDLES[req.body.bundleKey];
+  if (!email || !bundle) return res.status(400).json({ error: 'A user email and a valid bundle are required' });
+  const note = String(req.body.note || '').replace(/[^\w\s\-\/.,]/g, '').trim().slice(0, 60);
+  try {
+    const u = await pool.query('SELECT id, name, email FROM users WHERE LOWER(email) = $1', [email]);
+    if (!u.rows.length) return res.status(404).json({ error: 'No user registered with that email' });
+    const user = u.rows[0];
+    const reference = 'MANUAL-' + Date.now() + '-' + crypto.randomBytes(2).toString('hex') + (note ? ' ' + note : '');
+    await pool.query(
+      "INSERT INTO transactions (user_id, paystack_reference, bundle_name, reports_credited, amount_kobo, status, verified_at) VALUES ($1,$2,$3,$4,$5,'success',NOW())",
+      [user.id, reference, bundle.name + ' (manual)', bundle.reports, bundle.amount]
+    );
+    const upd = await pool.query('UPDATE users SET paid_credits = paid_credits + $1 WHERE id = $2 RETURNING paid_credits', [bundle.reports, user.id]);
+    res.json({ success: true, name: user.name, email: user.email, added: bundle.reports, paidCredits: upd.rows[0].paid_credits, reference });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not add credits: ' + err.message });
+  }
+});
+
 // Admin: set a temporary password for a user (fallback when email reset is not configured)
 app.post('/api/admin/reset-password', async (req, res) => {
-  const adminKey = req.headers['x-admin-key'];
-  if (!process.env.ADMIN_PASSWORD || adminKey !== process.env.ADMIN_PASSWORD) {
-    return res.status(403).json({ error: 'Admin access denied' });
-  }
-  const user = await getUserFromToken(req.headers.authorization?.replace('Bearer ', ''));
-  if (!user) return res.status(401).json({ error: 'Not authenticated' });
-  if (adminEmails().length && !isAdminUser(user)) return res.status(403).json({ error: 'Admin access denied' });
+  const adminUser = await adminGate(req, res);
+  if (!adminUser) return;
   const email = (req.body.email || '').trim().toLowerCase();
   if (!email) return res.status(400).json({ error: 'Email required' });
   try {
